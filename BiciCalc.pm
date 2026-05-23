@@ -10,6 +10,15 @@ our $PI = 4 * atan2(1, 1);
 sub deg2rad { $_[0] * $PI / 180 }
 sub rad2deg { $_[0] * 180 / $PI }
 sub asin    { atan2($_[0], sqrt(1 - $_[0]**2)) }
+sub acos    { atan2(sqrt(1 - $_[0]**2), $_[0]) }
+
+sub _angle_between {
+    my ($x1, $y1, $x2, $y2) = @_;
+    my $dot = $x1*$x2 + $y1*$y2;
+    $dot =  1 if $dot >  1;
+    $dot = -1 if $dot < -1;
+    return acos($dot);
+}
 
 # ---------------------------------------------------------------------------
 # Input data
@@ -35,6 +44,9 @@ our %input = (
 
     # Fork
     fork_rake           => 45,    # mm, perpendicular offset from steering axis to axle
+
+    # Rear triangle
+    ss_height           => 490,   # mm, height above BB where seatstays attach to seat tube
 
     # Tube outer diameters (mm)
     head_tube_od        => 31.8,
@@ -65,6 +77,26 @@ our %calc = (
     stack               => undef,   # mm, BB center to top of HT (vertical)
     reach               => undef,   # mm, BB center to top of HT (horizontal)
     effective_top_tube  => undef,   # mm, horizontal projection of TT
+
+    # Internal frame layout points (BB = origin)
+    ht_bot_x            => undef,
+    ht_bot_y            => undef,
+
+    # Tube angles
+    dt_angle            => undef,   # degrees, DT inclination from horizontal
+    seatstay_length     => undef,   # mm, computed from ss_height + rear axle position
+
+    # Miter joint angles (degrees, interior angle between tube centerlines)
+    miter => {
+        ht_top_tt  => undef,   # TT/HT at HT top lug
+        ht_bot_dt  => undef,   # DT/HT at HT bottom lug
+        st_top_tt  => undef,   # TT/ST at ST top lug
+        bb_st      => undef,   # ST approach angle at BB shell (= STA)
+        bb_dt      => undef,   # DT approach angle at BB shell
+        bb_cs      => undef,   # CS approach angle at BB shell
+        ss_st      => undef,   # SS/ST joint at seat tube
+        ss_cs      => undef,   # SS/CS joint at rear dropout
+    },
 );
 
 # ---------------------------------------------------------------------------
@@ -147,6 +179,8 @@ sub _calc_frame_layout {
     # HT bottom (TT junction on HT side) — TT end
     my $ht_bot_x = $st_top_x + $tt_dx;
     my $ht_bot_y = $st_top_y + $tt_dy;
+    $calc{ht_bot_x} = $ht_bot_x;
+    $calc{ht_bot_y} = $ht_bot_y;
 
     # HT runs along head_tube_angle; top is above bottom
     my $ht_top_x = $ht_bot_x + $ht_len * cos($hta);
@@ -170,12 +204,87 @@ sub _calc_frame_layout {
     );
 }
 
+sub calc_miters {
+    _calc_frame_layout() unless defined $calc{ht_bot_x};
+
+    my $hta   = deg2rad($input{head_tube_angle});
+    my $sta   = deg2rad($input{seat_tube_angle});
+    my $slope = deg2rad($input{top_tube_slope});
+
+    # HT top: TT meets HT.  Vectors pointing away from joint along each tube.
+    # TT goes toward ST: (-cos(slope), sin(slope))
+    # HT goes downward: (-cos(hta), -sin(hta))
+    $calc{miter}{ht_top_tt} = rad2deg(
+        _angle_between(-cos($slope), sin($slope), -cos($hta), -sin($hta))
+    );
+
+    # ST top: TT meets ST.
+    # TT goes toward HT: (cos(slope), -sin(slope))
+    # ST goes downward toward BB: (cos(sta), -sin(sta))
+    $calc{miter}{st_top_tt} = rad2deg(
+        _angle_between(cos($slope), -sin($slope), cos($sta), -sin($sta))
+    );
+
+    # DT direction from BB toward HT bottom
+    my ($bx, $by) = ($calc{ht_bot_x}, $calc{ht_bot_y});
+    my $dt_len = sqrt($bx**2 + $by**2);
+    my ($dx, $dy) = ($bx / $dt_len, $by / $dt_len);
+    $calc{dt_angle} = rad2deg(atan2($dy, $dx));
+
+    # HT bottom: DT meets HT.
+    # Both vectors point away from BB along their tubes (same general direction),
+    # giving the acute divergence angle used in lug selection and jig setup.
+    # DT going toward HT bottom: (dx, dy)
+    # HT going upward from HT bottom: (cos(hta), sin(hta))
+    $calc{miter}{ht_bot_dt} = rad2deg(
+        _angle_between($dx, $dy, cos($hta), sin($hta))
+    );
+
+    # BB shell angles (tube approach angle from horizontal)
+    $calc{miter}{bb_st} = $input{seat_tube_angle};
+    $calc{miter}{bb_dt} = $calc{dt_angle};
+
+    my $cs_angle = asin($input{bb_drop} / $input{chainstay_length});
+    $calc{miter}{bb_cs} = rad2deg($cs_angle);
+
+    # Seatstay miters (requires ss_height input)
+    if (defined $input{ss_height}) {
+        # SS attaches to ST at a point where height above BB = ss_height
+        my $ss_d      = $input{ss_height} / sin($sta);
+        my $ss_att_x  = -$ss_d * cos($sta);
+        my $ss_att_y  =  $ss_d * sin($sta);
+
+        # Rear axle position relative to BB
+        my $axle_x = -(sqrt($input{chainstay_length}**2 - $input{bb_drop}**2));
+        my $axle_y =  $input{bb_drop};
+
+        # SS vector from attachment toward axle
+        my $ss_dx  = $axle_x - $ss_att_x;
+        my $ss_dy  = $axle_y - $ss_att_y;
+        my $ss_len = sqrt($ss_dx**2 + $ss_dy**2);
+        $calc{seatstay_length} = $ss_len;
+
+        # SS/ST angle: ST going downward (cos(sta), -sin(sta)) vs SS toward axle
+        $calc{miter}{ss_st} = rad2deg(
+            _angle_between(cos($sta), -sin($sta), $ss_dx/$ss_len, $ss_dy/$ss_len)
+        );
+
+        # SS/CS angle at dropout:
+        # CS toward BB from axle: (cos(cs_angle), -sin(cs_angle)) [forward, slightly down]
+        # SS toward ST from axle: (-ss_dx/ss_len, -ss_dy/ss_len)
+        $calc{miter}{ss_cs} = rad2deg(
+            _angle_between(cos($cs_angle), -sin($cs_angle), -$ss_dx/$ss_len, -$ss_dy/$ss_len)
+        );
+    }
+}
+
 sub calc_all {
     calc_wheel_radius();
     calc_bb_height();
     calc_seat_tube();
     calc_trail();
     _calc_frame_layout();
+    calc_miters();
 }
 
 1;
